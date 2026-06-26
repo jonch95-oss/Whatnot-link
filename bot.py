@@ -1,8 +1,9 @@
 """
-Whatnot Mod User Tagger
------------------------
-Joins a Whatnot show as a moderator, collects active chatters and viewers,
-then @tags them in your own show.
+Whatnot User Tagger
+-------------------
+Joins any Whatnot show as a viewer (or mod), collects usernames from chat,
+then @tags them in your own show. Mod access is optional — it only unlocks
+the viewer list panel for extra names.
 
 Usage:
     cp .env.example .env        # fill in your credentials and show URLs
@@ -39,6 +40,7 @@ COLLECT_DURATION = int(os.getenv("COLLECT_DURATION_SECONDS", "120"))
 TAG_DELAY = float(os.getenv("TAG_DELAY_SECONDS", "2.5"))
 TAG_MESSAGE = os.getenv("TAG_MESSAGE", "Come check out this show!")
 SKIP_OWN_USERNAME = os.getenv("SKIP_OWN_USERNAME", "true").lower() in ("1", "true", "yes")
+TRY_VIEWER_LIST = os.getenv("TRY_VIEWER_LIST", "true").lower() in ("1", "true", "yes")
 
 USERS_FILE = Path("collected_users.txt")
 SESSION_FILE = Path("whatnot_session.json")
@@ -62,6 +64,28 @@ USERNAME_IN_CHAT_SELECTORS = [
     '[class*="username"]',
     '[class*="displayName"]',
     '[class*="authorName"]',
+]
+
+CHAT_MESSAGE_SELECTORS = [
+    '[data-testid="chat-message"]',
+    '[class*="ChatMessage"]',
+    '[class*="chat-message"]',
+    '[class*="Comment"]',
+    '[class*="comment"]',
+]
+
+CHAT_CONTAINER_SELECTORS = [
+    '[data-testid="chat-messages"]',
+    '[data-testid="chat-scroll"]',
+    '[class*="ChatMessages"]',
+    '[class*="chat-messages"]',
+    '[class*="messageList"]',
+    '[class*="MessageList"]',
+]
+
+CHAT_USER_LINK_SELECTORS = [
+    'a[href*="/user/"]',
+    'a[href*="/profile/"]',
 ]
 
 VIEWER_LIST_TOGGLE_SELECTORS = [
@@ -90,6 +114,8 @@ SKIP_USERNAMES = {
 }
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.]{2,30}$")
+MENTION_RE = re.compile(r"@([a-zA-Z0-9_.]{2,30})\b")
+USER_HREF_RE = re.compile(r"/(?:user|profile)/([a-zA-Z0-9_.]{2,30})")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -123,16 +149,34 @@ def normalize_username(raw: str) -> str | None:
     return text
 
 
+def extract_usernames_from_text(text: str, found: set):
+    """Pull @mentions and /user/ links out of free-form chat text."""
+    for match in MENTION_RE.finditer(text):
+        normalized = normalize_username(match.group(1))
+        if normalized:
+            found.add(normalized)
+    for match in USER_HREF_RE.finditer(text):
+        normalized = normalize_username(match.group(1))
+        if normalized:
+            found.add(normalized)
+
+
 def extract_usernames_from_json(data: object, found: set):
     """Recursively walk a JSON blob and harvest any username-shaped values."""
-    if isinstance(data, dict):
+    if isinstance(data, str):
+        extract_usernames_from_text(data, found)
+    elif isinstance(data, dict):
         for key in ("username", "user_name", "handle", "displayName", "display_name",
-                    "userName", "screenName", "screen_name"):
+                    "userName", "screenName", "screen_name", "body", "message",
+                    "text", "content", "comment"):
             val = data.get(key)
             if isinstance(val, str):
                 normalized = normalize_username(val)
-                if normalized:
+                if normalized and key in ("username", "user_name", "handle", "displayName",
+                                          "display_name", "userName", "screenName", "screen_name"):
                     found.add(normalized)
+                else:
+                    extract_usernames_from_text(val, found)
         for v in data.values():
             extract_usernames_from_json(v, found)
     elif isinstance(data, list):
@@ -194,6 +238,7 @@ class WhatnotBot:
         self.collected_users: set[str] = set()
         self._ws_users: set[str] = set()
         self._own_username: str | None = None
+        self._viewer_list_available: bool | None = None
 
     def _add_user(self, raw: str, source: str = ""):
         normalized = normalize_username(raw)
@@ -292,10 +337,17 @@ class WhatnotBot:
         return False
 
     async def _scrape_viewer_list(self, page: Page):
-        opened = await self._open_viewer_list(page)
-        if not opened:
+        if not TRY_VIEWER_LIST:
             return
 
+        opened = await self._open_viewer_list(page)
+        if not opened:
+            if self._viewer_list_available is None:
+                self._viewer_list_available = False
+                print("  [*] Viewer list not available (normal for regular viewers)")
+            return
+
+        self._viewer_list_available = True
         for selector in VIEWER_LIST_ITEM_SELECTORS:
             try:
                 elements = await page.query_selector_all(selector)
@@ -306,9 +358,61 @@ class WhatnotBot:
             except Exception:
                 pass
 
+    async def _scrape_chat(self, page: Page):
+        """Collect usernames from visible chat — works for any viewer."""
+        for selector in USERNAME_IN_CHAT_SELECTORS:
+            try:
+                elements = await page.query_selector_all(selector)
+                for el in elements:
+                    text = (await el.inner_text()).strip()
+                    self._add_user(text, source="chat")
+            except Exception:
+                pass
+
+        for selector in CHAT_USER_LINK_SELECTORS:
+            try:
+                elements = await page.query_selector_all(selector)
+                for el in elements:
+                    href = await el.get_attribute("href") or ""
+                    for match in USER_HREF_RE.finditer(href):
+                        self._add_user(match.group(1), source="chat link")
+                    text = (await el.inner_text()).strip()
+                    self._add_user(text, source="chat link")
+            except Exception:
+                pass
+
+        for selector in CHAT_MESSAGE_SELECTORS:
+            try:
+                elements = await page.query_selector_all(selector)
+                for el in elements:
+                    text = await el.inner_text()
+                    for match in MENTION_RE.finditer(text):
+                        self._add_user(match.group(1), source="chat mention")
+            except Exception:
+                pass
+
+    async def _scroll_chat_history(self, page: Page):
+        """Scroll the chat panel to surface older messages."""
+        for selector in CHAT_CONTAINER_SELECTORS:
+            try:
+                container = await page.query_selector(selector)
+                if container:
+                    await container.evaluate("el => el.scrollTop = 0")
+                    await asyncio.sleep(0.5)
+                    return
+            except Exception:
+                pass
+
+        try:
+            await page.mouse.wheel(0, -400)
+        except Exception:
+            pass
+
     async def collect_users(self, page: Page):
         print("[*] Navigating to target show...")
-        print("    Note: you must already be a mod on this show to see the full viewer list.")
+        print("    Joining as a regular viewer — collecting from live chat.")
+        if TRY_VIEWER_LIST:
+            print("    (Will also try the viewer list if you happen to be a mod.)")
 
         async def on_response(response):
             content_type = response.headers.get("content-type", "")
@@ -342,28 +446,33 @@ class WhatnotBot:
         await page.goto(TARGET_SHOW_URL, wait_until="domcontentloaded")
         await self._detect_own_username(page)
         await asyncio.sleep(3)
+        await self._scroll_chat_history(page)
+        await self._scrape_chat(page)
         await self._scrape_viewer_list(page)
 
-        print(f"[*] Collecting users for {COLLECT_DURATION} seconds — chat, API, and viewer list...")
+        sources = "chat, API"
+        if TRY_VIEWER_LIST:
+            sources += ", viewer list (if mod)"
+        print(f"[*] Collecting users for {COLLECT_DURATION} seconds — {sources}...")
         deadline = time.monotonic() + COLLECT_DURATION
         viewer_scrape_interval = 0
+        scroll_interval = 0
 
         while time.monotonic() < deadline:
             remaining = int(deadline - time.monotonic())
 
-            for selector in USERNAME_IN_CHAT_SELECTORS:
-                try:
-                    elements = await page.query_selector_all(selector)
-                    for el in elements:
-                        text = (await el.inner_text()).strip()
-                        self._add_user(text, source="chat DOM")
-                except Exception:
-                    pass
+            await self._scrape_chat(page)
 
-            viewer_scrape_interval += 3
-            if viewer_scrape_interval >= 15:
-                await self._scrape_viewer_list(page)
-                viewer_scrape_interval = 0
+            scroll_interval += 3
+            if scroll_interval >= 12:
+                await self._scroll_chat_history(page)
+                scroll_interval = 0
+
+            if TRY_VIEWER_LIST:
+                viewer_scrape_interval += 3
+                if viewer_scrape_interval >= 15:
+                    await self._scrape_viewer_list(page)
+                    viewer_scrape_interval = 0
 
             sys.stdout.write(f"\r  ... {remaining}s remaining, {len(self._ws_users)} users collected")
             sys.stdout.flush()
