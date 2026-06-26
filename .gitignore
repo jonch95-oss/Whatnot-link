@@ -1,0 +1,7 @@
+.env
+whatnot_session.json
+collected_users.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
