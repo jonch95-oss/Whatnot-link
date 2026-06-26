@@ -2,8 +2,7 @@
 Whatnot User Tagger
 -------------------
 Joins any Whatnot show as a viewer (or mod), collects usernames from chat,
-then @tags them in your own show. Mod access is optional — it only unlocks
-the viewer list panel for extra names.
+the sold/buyers list, then @tags them in your own show. Mod access is optional.
 
 Usage:
     cp .env.example .env        # fill in your credentials and show URLs
@@ -41,6 +40,7 @@ TAG_DELAY = float(os.getenv("TAG_DELAY_SECONDS", "2.5"))
 TAG_MESSAGE = os.getenv("TAG_MESSAGE", "Come check out this show!")
 SKIP_OWN_USERNAME = os.getenv("SKIP_OWN_USERNAME", "true").lower() in ("1", "true", "yes")
 TRY_VIEWER_LIST = os.getenv("TRY_VIEWER_LIST", "true").lower() in ("1", "true", "yes")
+COLLECT_SOLD_LIST = os.getenv("COLLECT_SOLD_LIST", "true").lower() in ("1", "true", "yes")
 
 USERS_FILE = Path("collected_users.txt")
 SESSION_FILE = Path("whatnot_session.json")
@@ -108,6 +108,73 @@ VIEWER_LIST_ITEM_SELECTORS = [
     '[class*="WatchingTab"] button',
 ]
 
+SOLD_LIST_TOGGLE_SELECTORS = [
+    'button:has-text("Sold")',
+    '[data-testid="sold-tab"]',
+    '[data-testid="sold-list-tab"]',
+    '[class*="SoldTab"]',
+    '[class*="soldTab"]',
+    '[class*="SoldListTab"]',
+    'button[aria-label*="Sold"]',
+    'button:has-text("Sales")',
+    '[role="tab"]:has-text("Sold")',
+]
+
+SOLD_LIST_CONTAINER_SELECTORS = [
+    '[data-testid="sold-list"]',
+    '[data-testid="sold-items"]',
+    '[class*="SoldList"]',
+    '[class*="soldList"]',
+    '[class*="sold-list"]',
+    '[class*="SalesList"]',
+    '[class*="salesList"]',
+]
+
+SOLD_LIST_ITEM_SELECTORS = [
+    '[data-testid="sold-item"]',
+    '[data-testid="sold-list-item"]',
+    '[class*="SoldItem"]',
+    '[class*="soldItem"]',
+    '[class*="SoldList"] [class*="username"]',
+    '[class*="SoldList"] [class*="buyer"]',
+    '[class*="SoldList"] [class*="Buyer"]',
+    '[class*="sold-list"] [class*="username"]',
+    '[class*="sold-list"] [class*="buyer"]',
+    '[class*="PurchaseItem"] [class*="username"]',
+    '[class*="purchase"] [class*="username"]',
+    '[class*="OrderItem"] [class*="username"]',
+    '[class*="order"] [class*="buyer"]',
+]
+
+ACTIVITY_TAB_SELECTORS = [
+    'button:has-text("Activity")',
+    '[data-testid="activity-tab"]',
+    '[class*="ActivityTab"]',
+    '[role="tab"]:has-text("Activity")',
+]
+
+ACTIVITY_PURCHASE_SELECTORS = [
+    '[data-testid="activity-item"]',
+    '[class*="ActivityItem"]',
+    '[class*="activityItem"]',
+    '[class*="Activity"] [class*="purchase"]',
+    '[class*="Activity"] [class*="Purchase"]',
+    '[class*="Activity"] [class*="auction"]',
+    '[class*="Activity"] [class*="Auction"]',
+    '[class*="activity"] [class*="username"]',
+]
+
+SALE_OVERLAY_SELECTORS = [
+    '[class*="Winner"]',
+    '[class*="winner"]',
+    '[class*="SoldOverlay"]',
+    '[class*="soldOverlay"]',
+    '[class*="AuctionResult"]',
+    '[class*="auctionResult"]',
+    '[class*="PurchaseNotification"]',
+    '[class*="purchaseNotification"]',
+]
+
 SKIP_USERNAMES = {
     "whatnot", "system", "moderator", "mod", "host", "seller", "admin",
     "support", "bot", "anonymous", "guest",
@@ -116,6 +183,19 @@ SKIP_USERNAMES = {
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.]{2,30}$")
 MENTION_RE = re.compile(r"@([a-zA-Z0-9_.]{2,30})\b")
 USER_HREF_RE = re.compile(r"/(?:user|profile)/([a-zA-Z0-9_.]{2,30})")
+SOLD_TO_RE = re.compile(
+    r"(?:sold to|won by|purchased by|buyer|winner|bought by)\s*:?\s*@?([a-zA-Z0-9_.]{2,30})\b",
+    re.IGNORECASE,
+)
+
+BUYER_JSON_KEYS = frozenset({
+    "username", "user_name", "handle", "displayName", "display_name",
+    "userName", "screenName", "screen_name",
+    "buyer", "buyerUsername", "buyer_username", "buyerName", "buyer_name",
+    "winner", "winnerUsername", "winner_username", "winnerName", "winner_name",
+    "purchaser", "purchaserUsername", "soldTo", "sold_to", "winningBidder",
+    "winning_bidder", "bidder", "bidderUsername", "customer", "customerUsername",
+})
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -150,7 +230,7 @@ def normalize_username(raw: str) -> str | None:
 
 
 def extract_usernames_from_text(text: str, found: set):
-    """Pull @mentions and /user/ links out of free-form chat text."""
+    """Pull @mentions, /user/ links, and sold-to patterns out of text."""
     for match in MENTION_RE.finditer(text):
         normalized = normalize_username(match.group(1))
         if normalized:
@@ -159,24 +239,31 @@ def extract_usernames_from_text(text: str, found: set):
         normalized = normalize_username(match.group(1))
         if normalized:
             found.add(normalized)
+    for match in SOLD_TO_RE.finditer(text):
+        normalized = normalize_username(match.group(1))
+        if normalized:
+            found.add(normalized)
 
 
 def extract_usernames_from_json(data: object, found: set):
-    """Recursively walk a JSON blob and harvest any username-shaped values."""
+    """Recursively walk a JSON blob and harvest usernames and buyer fields."""
     if isinstance(data, str):
         extract_usernames_from_text(data, found)
     elif isinstance(data, dict):
-        for key in ("username", "user_name", "handle", "displayName", "display_name",
-                    "userName", "screenName", "screen_name", "body", "message",
-                    "text", "content", "comment"):
-            val = data.get(key)
-            if isinstance(val, str):
+        event_type = str(data.get("type", data.get("event", data.get("eventType", "")))).lower()
+        is_sale_event = any(k in event_type for k in ("sold", "purchase", "order", "win", "bid", "buyer"))
+
+        for key, val in data.items():
+            if not isinstance(val, str):
+                continue
+            key_lower = key.lower()
+            if key_lower in BUYER_JSON_KEYS or (is_sale_event and "user" in key_lower):
                 normalized = normalize_username(val)
-                if normalized and key in ("username", "user_name", "handle", "displayName",
-                                          "display_name", "userName", "screenName", "screen_name"):
+                if normalized:
                     found.add(normalized)
-                else:
-                    extract_usernames_from_text(val, found)
+            elif key in ("body", "message", "text", "content", "comment", "title", "description"):
+                extract_usernames_from_text(val, found)
+
         for v in data.values():
             extract_usernames_from_json(v, found)
     elif isinstance(data, list):
@@ -239,6 +326,8 @@ class WhatnotBot:
         self._ws_users: set[str] = set()
         self._own_username: str | None = None
         self._viewer_list_available: bool | None = None
+        self._sold_list_opened = False
+        self._activity_tab_opened = False
 
     def _add_user(self, raw: str, source: str = ""):
         normalized = normalize_username(raw)
@@ -323,17 +412,23 @@ class WhatnotBot:
     # Collect users from target show
     # ------------------------------------------------------------------
 
-    async def _open_viewer_list(self, page: Page):
-        for selector in VIEWER_LIST_TOGGLE_SELECTORS:
+    async def _click_first_visible(self, page: Page, selectors: list[str]) -> str | None:
+        for selector in selectors:
             try:
                 el = await page.query_selector(selector)
                 if el and await el.is_visible():
                     await el.click()
                     await asyncio.sleep(1)
-                    print(f"  [+] Opened viewer list via: {selector}")
-                    return True
+                    return selector
             except Exception:
                 continue
+        return None
+
+    async def _open_viewer_list(self, page: Page):
+        selector = await self._click_first_visible(page, VIEWER_LIST_TOGGLE_SELECTORS)
+        if selector:
+            print(f"  [+] Opened viewer list via: {selector}")
+            return True
         return False
 
     async def _scrape_viewer_list(self, page: Page):
@@ -357,6 +452,90 @@ class WhatnotBot:
                         self._add_user(part, source="viewer list")
             except Exception:
                 pass
+
+    async def _open_sold_list(self, page: Page) -> bool:
+        if self._sold_list_opened:
+            return True
+        selector = await self._click_first_visible(page, SOLD_LIST_TOGGLE_SELECTORS)
+        if selector:
+            self._sold_list_opened = True
+            print(f"  [+] Opened sold list via: {selector}")
+            return True
+        return False
+
+    async def _open_activity_tab(self, page: Page) -> bool:
+        if self._activity_tab_opened:
+            return True
+        selector = await self._click_first_visible(page, ACTIVITY_TAB_SELECTORS)
+        if selector:
+            self._activity_tab_opened = True
+            print(f"  [+] Opened activity tab via: {selector}")
+            return True
+        return False
+
+    async def _scroll_sold_list(self, page: Page):
+        for selector in SOLD_LIST_CONTAINER_SELECTORS:
+            try:
+                container = await page.query_selector(selector)
+                if container:
+                    await container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                    await asyncio.sleep(0.5)
+                    return
+            except Exception:
+                pass
+
+    async def _scrape_element_users(self, page: Page, selectors: list[str], source: str):
+        for selector in selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+                for el in elements:
+                    href = await el.get_attribute("href") or ""
+                    for match in USER_HREF_RE.finditer(href):
+                        self._add_user(match.group(1), source=source)
+                    text = (await el.inner_text()).strip()
+                    for match in SOLD_TO_RE.finditer(text):
+                        self._add_user(match.group(1), source=source)
+                    for match in MENTION_RE.finditer(text):
+                        self._add_user(match.group(1), source=source)
+                    for part in re.split(r"[\s\n|•·]+", text):
+                        self._add_user(part, source=source)
+            except Exception:
+                pass
+
+    async def _scrape_sold_list(self, page: Page):
+        """Collect buyer usernames from the sold items panel."""
+        if not COLLECT_SOLD_LIST:
+            return
+
+        await self._open_sold_list(page)
+        await self._scrape_element_users(page, SOLD_LIST_ITEM_SELECTORS, source="sold list")
+        await self._scrape_element_users(page, SALE_OVERLAY_SELECTORS, source="sale overlay")
+
+        # Sold list often nests buyer names in profile links
+        for selector in SOLD_LIST_CONTAINER_SELECTORS:
+            try:
+                container = await page.query_selector(selector)
+                if not container:
+                    continue
+                links = await container.query_selector_all('a[href*="/user/"], a[href*="/profile/"]')
+                for link in links:
+                    href = await link.get_attribute("href") or ""
+                    for match in USER_HREF_RE.finditer(href):
+                        self._add_user(match.group(1), source="sold list link")
+                    text = (await link.inner_text()).strip()
+                    self._add_user(text, source="sold list link")
+            except Exception:
+                pass
+
+        await self._scroll_sold_list(page)
+
+    async def _scrape_activity_purchases(self, page: Page):
+        """Collect buyers from the Activity tab (purchases, auction wins)."""
+        if not COLLECT_SOLD_LIST:
+            return
+
+        await self._open_activity_tab(page)
+        await self._scrape_element_users(page, ACTIVITY_PURCHASE_SELECTORS, source="activity purchase")
 
     async def _scrape_chat(self, page: Page):
         """Collect usernames from visible chat — works for any viewer."""
@@ -410,7 +589,7 @@ class WhatnotBot:
 
     async def collect_users(self, page: Page):
         print("[*] Navigating to target show...")
-        print("    Joining as a regular viewer — collecting from live chat.")
+        print("    Joining as a regular viewer — collecting from chat and sold list.")
         if TRY_VIEWER_LIST:
             print("    (Will also try the viewer list if you happen to be a mod.)")
 
@@ -435,7 +614,7 @@ class WhatnotBot:
                     before = len(self._ws_users)
                     extract_usernames_from_json(data, self._ws_users)
                     for u in list(self._ws_users)[before:]:
-                        print(f"  [+] Chat user: {u}")
+                        print(f"  [+] User: {u}")
                 except Exception:
                     pass
             ws.on("framereceived", on_frame)
@@ -448,20 +627,30 @@ class WhatnotBot:
         await asyncio.sleep(3)
         await self._scroll_chat_history(page)
         await self._scrape_chat(page)
+        await self._scrape_sold_list(page)
+        await self._scrape_activity_purchases(page)
         await self._scrape_viewer_list(page)
 
-        sources = "chat, API"
+        sources = "chat, sold list, API"
         if TRY_VIEWER_LIST:
             sources += ", viewer list (if mod)"
         print(f"[*] Collecting users for {COLLECT_DURATION} seconds — {sources}...")
         deadline = time.monotonic() + COLLECT_DURATION
         viewer_scrape_interval = 0
+        sold_scrape_interval = 0
         scroll_interval = 0
 
         while time.monotonic() < deadline:
             remaining = int(deadline - time.monotonic())
 
             await self._scrape_chat(page)
+
+            if COLLECT_SOLD_LIST:
+                sold_scrape_interval += 3
+                if sold_scrape_interval >= 9:
+                    await self._scrape_sold_list(page)
+                    await self._scrape_activity_purchases(page)
+                    sold_scrape_interval = 0
 
             scroll_interval += 3
             if scroll_interval >= 12:

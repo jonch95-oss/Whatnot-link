@@ -9,8 +9,10 @@ A Python bot that logs into Whatnot, joins any live show as a **regular viewer**
 1. **Login** — Opens a Chromium browser and signs into your Whatnot account (supports saved sessions).
 2. **Collect** — Visits the target show and gathers usernames from:
    - Live chat messages (WebSocket + DOM)
-   - `@mentions` and profile links in chat
-   - API responses
+   - **Sold list** — buyers shown on sold items
+   - **Activity tab** — purchases and auction wins
+   - `@mentions` and profile links
+   - API / WebSocket sale events
    - Mod **viewer list** panel (bonus — only if you're a moderator)
 3. **Tag** — Goes to your show and sends `@username` messages in chat to invite viewers over.
 
@@ -43,6 +45,7 @@ playwright install chromium
 | `TAG_MESSAGE` | Message appended after each @tag |
 | `SKIP_OWN_USERNAME` | Skip your own username when collecting (default: true) |
 | `TRY_VIEWER_LIST` | Attempt mod viewer list if available (default: true) |
+| `COLLECT_SOLD_LIST` | Scrape sold list and activity tab for buyers (default: true) |
 
 ## Usage
 
@@ -65,11 +68,13 @@ python bot.py --tag-only --users-file my_users.txt
 | Source | Regular viewer | Moderator |
 |---|---|---|
 | Live chat usernames | Yes | Yes |
+| Sold list / buyers | Yes | Yes |
+| Activity (purchases, wins) | Yes | Yes |
 | @mentions in chat | Yes | Yes |
 | WebSocket / API data | Yes | Yes |
 | Full viewer list panel | No | Yes |
 
-As a viewer you'll mostly collect people who **chat** during your watch window. Longer `COLLECT_DURATION_SECONDS` (e.g. 3–5 minutes) on an active show will gather more names.
+As a viewer you'll collect people who **chat** and **buy** during your watch window. Longer `COLLECT_DURATION_SECONDS` (e.g. 3–5 minutes) on an active show will gather more names.
 
 ## Important notes
 
